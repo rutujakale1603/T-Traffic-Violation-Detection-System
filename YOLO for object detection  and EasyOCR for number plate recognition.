@@ -1,0 +1,129 @@
+import cv2
+import easyocr
+import sqlite3
+import os
+import time
+from datetime import datetime
+import numpy as np
+
+# Load YOLO model
+yolo_net = cv2.dnn.readNet("yolov3.weights", "yolov3.cfg")
+layer_names = yolo_net.getLayerNames()
+output_layers = [layer_names[i[0] - 1] for i in yolo_net.getUnconnectedOutLayers()]
+
+# Load the labels (rider, zebra crossing, traffic signal)
+labels = open("coco.names").read().strip().split("\n")
+rider_label = 'person'  # Assuming rider is recognized as 'person'
+zebra_label = 'zebra crossing'
+signal_label = 'traffic light'
+
+# Initialize OCR for number plate detection
+ocr_reader = easyocr.Reader(['en'])
+
+# Set up SQLite database for challans
+conn = sqlite3.connect('traffic_violations.db')
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS challans 
+             (id INTEGER PRIMARY KEY, rider_photo TEXT, number_plate_photo TEXT, violation TEXT, timestamp TEXT)''')
+
+# Function to detect objects in a frame using YOLO
+def detect_objects(frame):
+    height, width, channels = frame.shape
+    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
+    yolo_net.setInput(blob)
+    detections = yolo_net.forward(output_layers)
+
+    class_ids = []
+    confidences = []
+    boxes = []
+    for out in detections:
+        for detection in out:
+            scores = detection[5:]
+            class_id = np.argmax(scores)
+            confidence = scores[class_id]
+            if confidence > 0.5:
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
+
+                boxes.append([x, y, w, h])
+                confidences.append(float(confidence))
+                class_ids.append(class_id)
+
+    return class_ids, confidences, boxes
+
+# Function to check for violations
+def check_violation(frame, class_ids, boxes, labels):
+    rider_in_zebra_crossing = False
+    signal_is_red = False
+    zebra_crossing_box = None
+
+    for i, class_id in enumerate(class_ids):
+        label = labels[class_id]
+        if label == zebra_label:
+            zebra_crossing_box = boxes[i]
+        elif label == signal_label:
+            # We assume red light detection; this could be more sophisticated with color analysis
+            signal_is_red = True
+        elif label == rider_label and zebra_crossing_box is not None:
+            # Check if the rider is in the zebra crossing box
+            rider_box = boxes[i]
+            if (rider_box[0] >= zebra_crossing_box[0] and rider_box[1] >= zebra_crossing_box[1] and
+                rider_box[0] + rider_box[2] <= zebra_crossing_box[0] + zebra_crossing_box[2] and
+                rider_box[1] + rider_box[3] <= zebra_crossing_box[1] + zebra_crossing_box[3]):
+                rider_in_zebra_crossing = True
+
+    return rider_in_zebra_crossing, signal_is_red
+
+# Function to generate a challan and save the images
+def generate_challan(frame, number_plate):
+    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    rider_photo = f'photos/rider_{timestamp}.jpg'
+    number_plate_photo = f'number_plates/number_plate_{timestamp}.jpg'
+
+    cv2.imwrite(rider_photo, frame)
+
+    # Save the number plate photo (this assumes number_plate is a cropped image)
+    if number_plate is not None:
+        cv2.imwrite(number_plate_photo, number_plate)
+    else:
+        number_plate_photo = "Number plate not detected"
+
+    # Store challan in SQLite database
+    c.execute("INSERT INTO challans (rider_photo, number_plate_photo, violation, timestamp) VALUES (?, ?, ?, ?)",
+              (rider_photo, number_plate_photo, "Standing on zebra crossing during red signal", timestamp))
+    conn.commit()
+
+# Main video processing loop
+cap = cv2.VideoCapture('traffic_video.mp4')
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    class_ids, confidences, boxes = detect_objects(frame)
+    rider_in_zebra_crossing, signal_is_red = check_violation(frame, class_ids, boxes, labels)
+
+    if rider_in_zebra_crossing and signal_is_red:
+        # Perform OCR on number plate
+        number_plate_img = frame  # In a real application, this should be a cropped image of the number plate
+        number_plate_text = ocr_reader.readtext(number_plate_img)
+
+        # Generate a challan
+        generate_challan(frame, number_plate_img)
+
+        # Display feedback on Streamlit or OpenCV window (for testing purposes)
+        cv2.putText(frame, "Violation Detected: Challan Created", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    cv2.imshow('Frame', frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+conn.close()
